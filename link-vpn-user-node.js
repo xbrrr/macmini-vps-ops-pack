@@ -2,17 +2,24 @@ const mongoose = require('mongoose');
 
 (async () => {
   const uri = process.env.MONGO_URI;
+  const userId = process.env.CELERITY_USER_ID || 'vpn1';
+  const nodeIdValue = process.env.CELERITY_NODE_ID;
+
+  if (!nodeIdValue) {
+    throw new Error('CELERITY_NODE_ID is required');
+  }
+
   await mongoose.connect(uri);
   const HyUser = require('/app/src/models/hyUserModel');
   const cache = require('/app/src/services/cacheService');
-  const nodeId = new mongoose.Types.ObjectId('69c971677e39e4a0d87cfeaa');
+  const nodeId = new mongoose.Types.ObjectId(nodeIdValue);
   const u = await HyUser.findOneAndUpdate(
-    { userId: 'vpn1' },
+    { userId },
     { $set: { nodes: [nodeId] } },
     { new: true }
   );
   if (u && u.subscriptionToken) {
-    await cache.invalidateUser('vpn1');
+    await cache.invalidateUser(userId);
     await cache.invalidateSubscription(u.subscriptionToken);
   }
   console.log('updated', u ? u.userId : 'none');

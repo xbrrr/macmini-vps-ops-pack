@@ -1,5 +1,8 @@
-const mongoose = require('mongoose');
-const crypto = require('crypto');
+import crypto from 'node:crypto';
+import mongoose from 'mongoose';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
 
 (async () => {
   const uri = process.env.MONGO_URI;
