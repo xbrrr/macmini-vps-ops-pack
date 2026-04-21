@@ -1,0 +1,37 @@
+listen: :443
+auth:
+  type: http
+  http:
+    url: https://91-132-142-33.nip.io/api/auth
+    insecure: true
+masquerade:
+  type: proxy
+  proxy:
+    url: https://www.google.com
+    rewriteHost: true
+tls:
+  cert: /etc/hysteria/cert.pem
+  key: /etc/hysteria/key.pem
+sniff:
+  enable: true
+  timeout: 2s
+  rewriteDomain: false
+  tcpPorts: 80,443,8000-9000
+  udpPorts: 443,80,53
+quic:
+  initStreamReceiveWindow: 8388608
+  maxStreamReceiveWindow: 8388608
+  initConnReceiveWindow: 20971520
+  maxConnReceiveWindow: 20971520
+  maxIdleTimeout: 60s
+  maxIncomingStreams: 256
+  disablePathMTUDiscovery: false
+ignoreClientBandwidth: false
+trafficStats:
+  listen: :9999
+  secret: f80b744c126a1c2fde258901a378b69d
+acl:
+  inline:
+    - reject(geoip:cn)
+    - reject(geoip:private)
+    - direct(all)

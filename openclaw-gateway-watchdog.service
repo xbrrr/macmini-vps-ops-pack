@@ -1,0 +1,9 @@
+[Unit]
+Description=OpenClaw Gateway watchdog (health check)
+Wants=openclaw-gateway.service
+After=network.target openclaw-gateway.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/openclaw-gateway-watchdog.sh
+
