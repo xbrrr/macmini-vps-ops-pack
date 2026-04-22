@@ -11,6 +11,11 @@
 *secret*
 auth-test.json
 oauth_redirect_url.txt
+*.local.yaml
+*.local.yml
+*.rendered.yaml
+*.rendered.yml
+*.secrets.json
 
 # Node / JS
 node_modules/

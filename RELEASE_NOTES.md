@@ -6,6 +6,7 @@
 - Operational toolkit repository with scripts for OpenClaw, CELERITY, Hysteria, and VPN user management.
 - SSH alias and workflow support for Mac mini maintenance from Windows.
 - Gateway watchdog artifacts for OpenClaw (`.service`, `.timer`, `.sh`).
+- AnyDesk recovery helper and runbook for recurring `AnyNet closed` failures on the Mac mini.
 
 ### Infrastructure fixes completed
 - Restored stable SSH access to Mac mini through Tailscale and verified remote reachability.

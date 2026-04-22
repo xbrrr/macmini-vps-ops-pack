@@ -5,8 +5,14 @@ const mongoose = require('mongoose');
   const userId = process.env.CELERITY_USER_ID || 'vpn1';
   const nodeIdValue = process.env.CELERITY_NODE_ID;
 
+  if (!uri) {
+    throw new Error('MONGO_URI is required');
+  }
   if (!nodeIdValue) {
     throw new Error('CELERITY_NODE_ID is required');
+  }
+  if (!mongoose.Types.ObjectId.isValid(nodeIdValue)) {
+    throw new Error('CELERITY_NODE_ID must be a valid Mongo ObjectId');
   }
 
   await mongoose.connect(uri);

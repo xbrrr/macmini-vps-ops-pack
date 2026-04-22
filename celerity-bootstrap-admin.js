@@ -3,6 +3,9 @@ const crypto = require('crypto');
 
 (async () => {
   const uri = process.env.MONGO_URI;
+  if (!uri) {
+    throw new Error('MONGO_URI is required');
+  }
   await mongoose.connect(uri);
   const Admin = require('/app/src/models/adminModel');
   const ApiKey = require('/app/src/models/apiKeyModel');

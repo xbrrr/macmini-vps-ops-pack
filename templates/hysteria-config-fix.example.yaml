@@ -2,8 +2,8 @@ listen: :443
 auth:
   type: http
   http:
-    url: https://91-132-142-33.nip.io/api/auth
-    insecure: true
+    url: https://panel.example.com/api/auth
+    insecure: false
 masquerade:
   type: proxy
   proxy:
@@ -29,7 +29,7 @@ quic:
 ignoreClientBandwidth: false
 trafficStats:
   listen: :9999
-  secret: f80b744c126a1c2fde258901a378b69d
+  secret: CHANGE_ME_TRAFFIC_STATS_SECRET
 acl:
   inline:
     - reject(geoip:cn)
