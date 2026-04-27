@@ -24,6 +24,7 @@ Copy `.env.example` into your runtime environment or export only the variables y
 - `AGENTS.md`: working rules for Codex and other agents
 - `docs/`: security notes and operational history
 - `docs/ANYDESK_RECOVERY.md`: runbook for recurring `AnyNet closed` failures on macOS
+- `docs/REMOTE_MAC_OPENCLAW_RECOVERY.md`: sanitized runbook for combined Mac networking, Tailscale, AnyDesk, Karing, and OpenClaw recovery
 - `scripts/lib/common.sh`: shared bash safety helpers
 - `templates/`: sanitized config examples for rendered runtime files
 
