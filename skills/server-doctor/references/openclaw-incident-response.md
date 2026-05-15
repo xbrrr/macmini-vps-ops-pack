@@ -1,0 +1,1295 @@
+# OpenClaw Incident Response
+
+Use this reference when a Telegram bot is slow, unresponsive, partially working, or failing after startup.
+
+Before making strong health, outage, or recovery claims, also read:
+
+- `references/health-claims-and-evidence.md`
+- `references/outage-classification.md`
+
+## Claim discipline
+
+- separate spec correctness from ops quality
+- confirm the canonical runtime target before strong health wording:
+  - host
+  - owner
+  - unit, launch agent, container, or process tree
+  - runtime directory or state directory
+  - live port, socket, or endpoint
+- treat permission-limited visibility as `visibility-limited` or `unknown`, not outage proof
+- direct live probes and canonical runtime health beat stale legacy checks unless a stronger contradiction appears
+- restart alone is not recovery; require post-action proof
+
+## Symptom buckets
+
+### 1. Process is down
+
+Only use this bucket after the canonical target is confirmed.
+
+Checks:
+
+```bash
+ps aux | grep -Ei 'openclaw|gateway' | grep -v grep
+systemctl status <service> --no-pager
+launchctl list | grep -Ei 'openclaw|gateway'
+```
+
+Likely causes:
+
+- crashed process
+- failed boot dependency
+- broken service definition
+- missing environment after reboot
+
+### 2. Process is up, but Telegram does not respond
+
+Checks:
+
+```bash
+journalctl -u <service> -n 200 --no-pager
+tail -n 200 <logfile>
+```
+
+Look for:
+
+- authentication failures
+- Telegram delivery errors
+- network timeouts
+- upstream model failures
+- stale sockets
+- queue backlog
+
+### 3. Bot replies slowly
+
+Look for:
+
+- provider latency
+- repeated retries
+- model failover loops
+- blocked dependencies
+- CPU or memory pressure
+- container restarts
+
+### 4. Some features work, others fail
+
+This often indicates a dependency problem rather than a gateway problem.
+
+Check:
+
+- local HTTP dependencies
+- helper bots
+- sidecar APIs
+- databases
+- browser-control endpoints
+- cron or scheduler jobs
+
+## Recovery order
+
+1. Capture recent logs.
+2. Confirm the dependency graph.
+3. Restart the smallest failing component first.
+4. Verify the gateway only after dependencies are healthy.
+5. Re-test with a known-safe command.
+
+Do not call recovery confirmed until a post-action live probe succeeds on the canonical path.
+
+## Concrete scenarios
+
+Use `incidents/INDEX.md` when you need sanitized precedent notes after the current route is already chosen.
+
+Recommended precedent set:
+- `incidents/2026-03-28-runtime-bundle-corruption-and-wrong-root-hotfix.md`
+- `incidents/2026-04-01-plugin-runtime-contract-drift.md`
+- `incidents/2026-04-13-watchdog-stale-signal-restart-loop.md`
+- `incidents/2026-04-17-post-update-dual-root-and-periodic-restart-loop.md`
+
+### 5. Stale session model override
+
+#### Symptoms
+
+- global config already points at the desired model
+- one chat or one Telegram lane still behaves as if it uses an older or unsupported model
+- some sessions fail while others on the same host work
+
+#### Why this happens
+
+OpenClaw can keep per-session model state even after the main config was corrected. Fixing the default model does not always clear an older session override.
+
+#### Checks
+
+```bash
+rg -n '"modelOverride"|"model"' ~/.openclaw/agents/*/sessions/sessions.json
+rg -n 'unsupported|unknown model|fallback' ~/.openclaw/logs /tmp/openclaw 2>/dev/null
+```
+
+#### Recovery
+
+- identify which session still carries the old override
+- clear or replace that override with a supported model
+- restart the gateway only if the runtime does not pick up the state change cleanly
+- if the main defaults are wrong as well, normalize them first with a targeted config edit or a helper such as `scripts/normalize-openclaw-models.py`
+
+#### Validation
+
+- the affected session no longer reports the stale model
+- a fresh control prompt in the same chat uses the intended model without fallback
+
+### 6. Session runtime override drift
+
+#### Symptoms
+
+- status output claims a session is on a native runtime, but ordinary chat messages behave like a different runtime
+- slash commands still work, while normal dispatch fails with provider-auth errors
+- a route alias updates the model but the session still inherits an older agent runtime
+
+#### Why this happens
+
+Session state can carry both model selection and runtime selection. A helper that updates only `modelOverride` or a display-only runtime field can leave the real `agentRuntime` inherited from the agent or an older session. This creates a split where `/status` looks correct, but normal dispatch uses the wrong execution path.
+
+#### Checks
+
+Inspect the live session store, not only `/status`:
+
+```bash
+openclaw sessions --json --active 10 --all-agents --limit 20 \
+  | jq '.sessions[] | {key, modelProvider, model, providerOverride, modelOverride, agentHarnessId, agentRuntime, processing, waiting, queued}'
+
+rg -n '"agentRuntime"|"agentHarnessId"|"providerOverride"|"modelOverride"' ~/.openclaw/agents/*/sessions/sessions.json
+rg -n 'Missing API key|No API key|model-fallback|runtime' ~/.openclaw/logs /tmp/openclaw 2>/dev/null
+```
+
+#### Recovery
+
+- back up the affected session store before editing
+- set the intended provider/model overrides and the real runtime field together
+- for native Codex routes, make the session runtime explicit, for example `agentRuntime: {"id":"codex"}`
+- patch the route helper so future aliases preserve or set `agentRuntime` instead of deleting it
+- restart the gateway if the in-memory session does not reload cleanly
+
+#### Validation
+
+- the active session shows the intended `agentRuntime.id`
+- `/status` and `openclaw sessions --json` agree on model and runtime
+- a normal chat smoke test succeeds, not only a slash-command smoke test
+- process inspection shows only the expected native runtime sidecar, not a growing set of duplicate runtime processes
+
+### 7. Per-agent auth-profile drift
+
+#### Symptoms
+
+- Telegram shows one model as selected, but runtime falls back to another provider
+- one agent still works while another agent on the same host falls back or reports expired auth
+- failures cluster by agent rather than by whole host
+
+#### Why this happens
+
+Some OpenClaw installs keep auth state separately per agent under `~/.openclaw/agents/*/agent/auth-profiles.json`. One agent can refresh OAuth successfully while another keeps an older token set and enters cooldown.
+
+#### Checks
+
+```bash
+find ~/.openclaw/agents -path '*/agent/auth-profiles.json' -print
+rg -n 'expired|fallback|auth' ~/.openclaw/logs /tmp/openclaw 2>/dev/null
+```
+
+Manually compare the same profile id across agent auth stores:
+
+- refresh token presence
+- expiry timestamp
+- recent last-used state
+- auth cooldown or failure counters
+
+#### Recovery
+
+- choose the freshest working profile as the canonical source
+- sync drifted agents to that profile
+- clear stale auth cooldown state only for the affected provider/profile
+- back up every modified auth store before writing changes
+
+Public helper:
+
+```bash
+./scripts/openclaw-auth-profile-sync.sh --dry-run --host <ssh-host> --profile-id <provider:profile>
+./scripts/openclaw-auth-profile-sync.sh --apply --host <ssh-host> --profile-id <provider:profile>
+./scripts/openclaw-auth-profile-sync.sh --validate --host <ssh-host> --profile-id <provider:profile>
+```
+
+#### Validation
+
+- the inspected agents now share one consistent profile payload for the affected provider
+- cooldown state is cleared only where appropriate
+
+### 8. Native Codex websocket lane overload
+
+#### Symptoms
+
+- the gateway is alive and Telegram transport can send messages, but selected chats stop replying
+- logs show `codex app-server client is closed`, `connection closed during startup`, or repeated stalled `embedded_run` sessions
+- direct messages may recover while group/topic lanes stay stuck
+- session stores already show `modelProvider: openai`, `model: gpt-*`, and `agentRuntime.id: codex`
+
+#### Why this happens
+
+Native Codex websocket mode can fail when several OpenClaw lanes start embedded runs against the same `codex app-server` at once. The failure can leave per-chat session entries in `processing` even after the app-server is restarted.
+
+#### Checks
+
+```bash
+openclaw sessions --agent <agent-id> --json --limit 20
+journalctl --user -u openclaw-gateway.service --since '30 minutes ago' --no-pager | \
+  grep -Ei 'codex app-server|client is closed|retries exhausted|stalled session|lane task error|sendMessage'
+systemctl --user status codex-app-server.service openclaw-gateway.service --no-pager
+ss -ltnp | grep -E ':(<gateway-port>|<codex-app-server-port>)'
+```
+
+#### Recovery
+
+- keep the native route explicit: defaults and affected agents should use `openai/<model>` and `agentRuntime: {"id":"codex"}`
+- bound native Codex admission on affected tenants; for fragile websocket installs set `agents.defaults.maxConcurrent` and `agents.defaults.subagents.maxConcurrent` to `1`
+- ensure the singleton `codex-app-server.service` is active before restarting the gateway
+- archive only the stalled session-store entries for affected chat keys, preserving a backup under incident evidence
+- restart the gateway after session-store surgery so in-memory lanes are rebuilt from clean state
+
+#### Validation
+
+- a real Telegram smoke succeeds in every affected surface: DM, group, and forum topic
+- logs after the final restart do not contain fresh `client is closed`, `retries exhausted`, or stalled-session diagnostics for the tested keys
+- `openclaw sessions --json` for the tested keys reports `openai` model provider and native Codex runtime inheritance
+- a live Telegram probe no longer falls back to another provider
+
+#### Durable control-plane fix
+
+If the same tenant repeatedly hangs after manual repair, treat it as an architecture problem:
+
+- run a read-only stability audit before changing state:
+
+```bash
+python3 scripts/openclaw-native-codex-stability-audit.py \
+  --state-dir ~/.openclaw \
+  --owner "$USER" \
+  --codex-port '<codex-app-server-port>' \
+  --expected-cron-model mmfast \
+  --expected-cron-thinking high \
+  --json
+```
+
+- migrate or disable enabled cron jobs that still carry `openai-codex` payload state before blaming Telegram transport
+- when cron jobs are intentionally offloaded from native Codex, enforce both payload fields together, for example `model: mmfast` and `thinking: high`
+- keep long-running cron and proactive work out of the interactive Telegram blast radius; if they must use Codex, dispatch them through a bounded launcher or separate tenant
+- add hard systemd limits to the Codex app-server unit: `MemoryMax`, `TasksMax`, and `RuntimeMaxSec`
+
+For a `systemd --user` Codex app-server singleton, prefer an explicit drop-in:
+
+```ini
+# ~/.config/systemd/user/codex-app-server.service.d/70-resource-limits.conf
+[Service]
+MemoryMax=8G
+TasksMax=96
+RuntimeMaxSec=6h
+```
+
+Then reload and restart the smallest affected units:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user restart codex-app-server.service
+systemctl --user restart openclaw-gateway.service
+systemctl --user show codex-app-server.service -p MemoryMax -p TasksMax -p RuntimeMaxUSec
+```
+
+- use stale-session remediation as a reconciler loop, not as ad-hoc surgery:
+  - detect `stalled session` diagnostics
+  - archive only affected session keys
+  - restart only the smallest component that holds that lane in memory
+  - send a real Telegram smoke after the action
+- do not stop unrelated supervisors; they are separate control planes and may be required for ongoing work
+
+Minimum exit criteria:
+
+- no enabled cron job contains stale `openai-codex` route state
+- recent sessions do not report `modelProvider: openai-codex`
+- app-server worker count and memory stay below the tenant threshold during a soak window
+- DM, group, and topic smoke pass after the final gateway/app-server restart
+
+### 8. Native Codex profile drift inside existing sessions
+
+#### Symptoms
+
+- profile switch reports success, but native `openai/*` sessions still fail under a previous auth profile
+- `sessions.json` shows the intended `authProfileOverride`, while the runtime still reports a missing or stale Codex app-server auth profile
+- only already-created native Codex threads fail; fresh sessions or Pi-runtime sessions may still work
+
+#### Why this happens
+
+Native Codex sessions can carry app-server thread metadata outside the top-level session override. Updating only `authProfileOverride` in `sessions.json` may not rebind an already-created native Codex thread.
+
+#### Checks
+
+```bash
+rg -n '"authProfileOverride"|"modelProvider": "openai"|"providerOverride": "openai"' ~/.openclaw/agents/*/sessions/sessions.json
+rg -n '"authProfileId"|auth profile .* was not found|codex app-server' ~/.openclaw/agents/*/sessions/*.jsonl ~/.openclaw/agents/*/sessions/*.json 2>/dev/null
+```
+
+#### Recovery
+
+- back up the affected session store
+- for native `openai/*` sessions bound to the wrong app-server auth profile, archive the session entry and its session files so the next turn creates a fresh thread
+- then run the profile switch/sync helper again so per-agent auth stores agree
+- restart only the gateway if live memory still holds the stale session
+
+#### Validation
+
+- the next turn creates a new session id
+- the new session uses `modelProvider=openai` and the intended auth profile
+- live Telegram smoke succeeds in the affected chat or topic
+
+### 9. Long-lived Codex app-server client is closed
+
+#### Symptoms
+
+- native `openai/*` routes fail before reply with `codex app-server client is closed`
+- logs show repeated `codex app-server connection closed during startup` or `TokenRefreshFailed`
+- Pi-runtime `openai-codex/*` sessions still answer, but native Codex sessions stall or return generic error text
+
+#### Checks
+
+```bash
+ps -eo pid,ppid,stat,pcpu,pmem,etime,args | grep -E 'codex app-server|openclaw.*gateway' | grep -v grep
+journalctl --user --since '10 minutes ago' --no-pager | grep -Ei 'codex app-server|client is closed|TokenRefreshFailed|Failed to parse server response'
+```
+
+Also check for local port conflicts if app-server startup repeatedly spawns a helper:
+
+```bash
+ss -ltnp
+lsof -nP -iTCP:<port> -sTCP:LISTEN
+```
+
+#### Recovery
+
+- terminate only the stale Codex app-server process for the affected OpenClaw owner, not unrelated supervisors
+- restart the gateway so it reconnects to a fresh app-server
+- if native Codex still fails and the bot must be restored immediately, move only the affected agent/session back to the Pi route while leaving other native-Codex agents intact
+
+#### Validation
+
+- a native route smoke either succeeds or fails with a new, current error
+- fallback sessions answer normally if fallback was applied
+- supervisors remain active if they are required for ongoing work
+
+### 9a. Native Codex DM produces a reply internally but Telegram stays silent
+
+#### Symptoms
+
+- native `openai/*` plus `agentRuntime.id=codex` is selected
+- trajectory or session logs show a completed assistant reply
+- Telegram receives no visible message, or receives duplicate replies after a delivery-mode change
+- `/status` or `/gptprof status` is also silent or returns `Command not found`
+
+#### Checks
+
+```bash
+openclaw sessions --json --active 10 --all-agents --limit 20 \
+  | jq '.sessions[] | {key, providerOverride, modelOverride, agentRuntime, agentHarnessId, processing, queued}'
+
+rg -n 'assistantTexts|model.completed|sendMessage ok|Command not found|custom command|native commands' \
+  ~/.openclaw/agents/*/sessions ~/.openclaw/logs /tmp/openclaw 2>/dev/null
+```
+
+Also inspect `~/.openclaw/openclaw.json` for:
+
+- `messages.visibleReplies`
+- `channels.telegram.commands.native`
+- plugin/custom command entries that shadow native commands such as `status`, `reset`, or profile-switch commands
+
+#### Recovery
+
+- if normal final replies should be delivered by Telegram automatically, set `messages.visibleReplies` to `automatic`
+- if duplicate replies appear after that change, archive only the affected session so old system-prompt instructions to call a message tool do not combine with automatic delivery
+- enable Telegram native commands when `/status` is silent after an update
+- remove or rename custom command declarations that shadow native slash commands, and make profile-switch commands accept arguments when they need subcommands such as `status`
+- for native Codex cron jobs, migrate enabled payloads away from stale aliases or providers that are not registered in the native route
+
+#### Validation
+
+- a fresh normal DM smoke produces exactly one visible Telegram reply
+- `/status` reports the intended provider, model, runtime, profile, and queue depth
+- `/gptprof status` works when the profile-switch helper is expected to own that command
+- fresh logs show no provider-not-found errors from enabled cron payloads
+
+### 9b. Pi-route rollback must clean sessions and cron payload models
+
+#### Symptoms
+
+- native `openai/*` plus Codex runtime is rolled back to `openai-codex/*` plus Pi runtime, but some Telegram lanes still fail
+- DM replies mention a missing OpenAI API key even though `codex-profile-manager.py apply-pi-route` succeeded
+- logs continue to show `No API key found for provider "openai"` from `opscron`, `chipdigest`, or other cron lanes
+- a topic replies to stale context instead of the fresh smoke marker after the route rollback
+
+#### Root cause
+
+`apply-pi-route` can update the main agent/default route without rewriting all persisted state. Existing `sessions.json` entries may still carry `providerOverride=openai`, `modelProvider=openai`, or `agentRuntime.id=codex`. Enabled cron jobs in `~/.openclaw/cron/jobs.json` can also keep `payload.model="openai/gpt-5.5"` and recreate broken run sessions after the next schedule tick.
+
+#### Checks
+
+```bash
+rg -n '"providerOverride": "openai"|"modelProvider": "openai"|"agentHarnessId": "codex"|"agentRuntime"' \
+  ~/.openclaw/agents/*/sessions/sessions.json
+
+python3 - <<'PY'
+import json, pathlib
+p = pathlib.Path.home() / ".openclaw/cron/jobs.json"
+obj = json.loads(p.read_text())
+jobs = obj.get("jobs") if isinstance(obj, dict) else obj
+items = jobs.items() if isinstance(jobs, dict) else [(j.get("id"), j) for j in jobs]
+for jid, job in items:
+    payload = job.get("payload") if isinstance(job, dict) else None
+    if isinstance(payload, dict) and payload.get("model") == "openai/gpt-5.5":
+        print(jid, job.get("agentId"), job.get("name"))
+PY
+```
+
+#### Recovery
+
+- back up every touched `sessions.json` and `cron/jobs.json` before editing
+- archive only sessions that explicitly force direct OpenAI or Codex runtime while the host is on Pi route
+- rewrite enabled cron `payload.model` values from direct `openai/gpt-5.5` to the intended `openai-codex/gpt-5.5`
+- after an OpenClaw package update or service restart on a new build, re-check the route and repeat the stale-session scan; startup/recovery can flush old in-memory native session fields back to disk before the rollback is fully clean
+- restart only the affected `openclaw-gateway.service`; do not stop required supervisors unless direct evidence points to them
+
+#### Validation
+
+- `CRON_OPENAI_GPT55_COUNT` is `0`
+- stale session scan returns `0`
+- fresh DM and affected group/topic Telegram smokes get visible replies from `Claw`
+- fresh gateway logs show no new `No API key found for provider "openai"`, `ECONNREFUSED`, `client is closed`, or `retries exhausted` for the tested lanes
+
+### 10. Post-update Telegram transport regression
+
+#### Symptoms
+
+- Telegram transport became unreliable immediately after `openclaw update`, reinstall, or package refresh
+- startup succeeds but long-polling stalls, outbound send operations fail, or provider/plugin startup regresses
+- the host was stable before the package replacement
+
+#### Why this happens
+
+An update can replace the installed runtime bundles and discard local compatibility fixes or behavior that the current environment depended on.
+
+#### Checks
+
+```bash
+openclaw --version
+openclaw gateway status
+rg -n 'Polling stall detected|sendMessage failed|sendChatAction failed|failed to load plugin|channel exited' ~/.openclaw/logs /tmp/openclaw 2>/dev/null
+```
+
+Also compare:
+
+- package version before and after the incident, if known
+- whether installed `dist/` bundles changed recently
+- whether the regression started exactly after a refresh event
+
+On macOS LaunchAgent installs, also check whether the update replaced the startup path or leaked proxy env into Telegram traffic:
+
+```bash
+plutil -p ~/Library/LaunchAgents/ai.openclaw.gateway.plist 2>/dev/null | sed -n '1,160p'
+launchctl print gui/$UID/ai.openclaw.gateway 2>/dev/null | grep -E 'Program|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|no_proxy'
+```
+
+Red flags:
+
+- `ProgramArguments` now point directly to `node .../openclaw/dist/entry.js` instead of the host-local wrapper that used to harden env startup
+- the LaunchAgent plist now contains duplicated provider or bot secrets that previously lived only in `~/.openclaw/.env`
+- launchd injects `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` and `NO_PROXY` no longer includes `api.telegram.org`
+- `openclaw status --deep` shows `Telegram WARN` while `curl https://api.telegram.org` and a direct token `getMe` probe from the host still succeed
+- logs show `deleteWebhook`, `deleteMyCommands`, `setMyCommands`, or `This operation was aborted` immediately after the update
+
+#### Recovery
+
+- first check whether the new upstream build already includes an equivalent fix
+- if not, re-apply the minimal host-local compatibility patch required for that environment
+- avoid broad rewrites while transport is already unstable
+- document clearly when a patch is local containment rather than a universal upstream fix
+
+For macOS LaunchAgent drift after update:
+
+- keep the new OpenClaw version if the runtime itself is healthy
+- restore a wrapper startup path that sources `~/.openclaw/.env` instead of duplicating secrets into the plist
+- clear `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` inside the wrapper before starting OpenClaw
+- set `NO_PROXY` and `no_proxy` to include `api.telegram.org,127.0.0.1,localhost`
+- reload the LaunchAgent and validate with both `openclaw gateway status` and `openclaw status --deep`
+- if logs show repeated Telegram native-command churn or `BOT_COMMANDS_TOO_MUCH`, either reduce commands or set `channels.telegram.commands.native=false`
+
+Public helper:
+
+```bash
+./scripts/openclaw-telegram-transport-hotfix.sh --dry-run --host <ssh-host>
+./scripts/openclaw-telegram-transport-hotfix.sh --apply --host <ssh-host>
+./scripts/openclaw-telegram-transport-hotfix.sh --validate --host <ssh-host>
+# compatibility alias
+./scripts/openclaw-post-update-transport-hotfix.sh --dry-run --host <ssh-host>
+```
+
+#### Validation
+
+- gateway runtime is healthy after restart
+- Telegram provider starts normally
+- no immediate recurrence of the outbound transport errors in a control window longer than the old stall interval
+- on macOS, the active LaunchAgent no longer stores provider secrets directly in `EnvironmentVariables`
+- on macOS, a fresh `openclaw status --deep` shows `Telegram OK` after the wrapper/env recovery
+
+### 7a. Multi-install path drift between shell CLI and gateway service
+
+#### Symptoms
+
+- `openclaw doctor` or `openclaw memory index` behaves differently depending on how the command is invoked
+- shell `openclaw --version` and the running gateway appear to disagree about the installed build
+- plugin or config validation errors appear in one command path but not in the live runtime
+
+#### Why this happens
+
+Some hosts end up with more than one OpenClaw install tree after partial updates or mixed package-manager usage. The shell CLI, service unit, and explicit binary paths can silently resolve to different installs.
+
+#### Checks
+
+```bash
+command -v openclaw
+readlink -f "$(command -v openclaw)"
+readlink -f /usr/local/bin/openclaw 2>/dev/null || true
+readlink -f /opt/node-v22.22.0/bin/openclaw 2>/dev/null || true
+openclaw --version
+/usr/local/bin/openclaw --version 2>/dev/null || true
+/opt/node-v22.22.0/bin/openclaw --version 2>/dev/null || true
+systemctl --user show openclaw-gateway -p ExecStart
+```
+
+#### Recovery
+
+- choose one canonical install root and keep both CLI and gateway on that same tree
+- do not treat a second live install root as "the new canon" just because it became first on `PATH`
+- if needed, repoint shell launchers or service entrypoints so all command paths resolve to the same package tree
+
+Example fix pattern:
+
+```bash
+ln -sf /opt/node-v22.22.0/bin/openclaw ~/.npm-global/bin/openclaw
+systemctl --user daemon-reload
+systemctl --user restart openclaw-gateway
+```
+
+#### Validation
+
+- shell `openclaw` and the service `ExecStart` resolve to the same install root
+- `openclaw doctor` no longer warns that the gateway entrypoint differs from the current install
+- the previously inconsistent subcommand behaves the same through both shell and service-backed paths
+
+### 7b. Post-update canonical-root discipline
+
+#### Symptoms
+
+- an update "works", but later hotfixes, plugin checks, or memory tooling hit the wrong install tree
+- package refreshes silently reintroduce split-brain runtime state
+
+#### Why this happens
+
+The real problem is not the update itself but the loss of a single canonical OpenClaw root. Once two live roots exist again, diagnostics and repairs stop being trustworthy.
+
+#### Checks
+
+```bash
+command -v openclaw
+readlink -f "$(command -v openclaw)"
+systemctl --user show openclaw-gateway -p ExecStart
+openclaw gateway status
+```
+
+Confirm:
+
+- shell CLI points at the intended root
+- the running gateway service points at the same root
+- explicit binary paths do not resolve to a different OpenClaw package tree
+
+#### Recovery
+
+- keep one canonical install root after every package update
+- treat any second active root as drift
+- update launchers and units immediately before calling the update healthy
+
+#### Validation
+
+- shell CLI, service unit, and live runtime all resolve to one install tree
+- update-related diagnostics no longer disagree by invocation path
+
+### 7c. Safe dedupe when a bundled plugin is also loaded from config
+
+#### Symptoms
+
+- `openclaw doctor` warns about a duplicate plugin id
+- the same plugin appears both as bundled and as a config-loaded path install
+
+#### Why this happens
+
+A plugin that is now bundled with OpenClaw may still be explicitly loaded from an older custom path or install record. That creates duplicate-plugin warnings and makes plugin origin ambiguous.
+
+#### Checks
+
+```bash
+rg -n '"load"|"entries"|"installs"' ~/.openclaw/openclaw.json 2>/dev/null
+openclaw doctor
+```
+
+Look for:
+
+- a `plugins.load.paths` entry that points at a bundled plugin path
+- a matching `plugins.installs.<plugin-id>` record for the same legacy path
+- an existing `plugins.entries.<plugin-id>` block that only contains desired config
+
+#### Recovery
+
+- remove only the legacy path-loaded override and the matching install record
+- keep the plugin's config entry if it is still needed for the bundled plugin
+- do not remove the bundled plugin or its config block just to silence the warning
+
+#### Validation
+
+- `openclaw doctor` no longer reports the duplicate plugin id
+- the plugin still loads normally from the bundled runtime
+- plugin-specific config remains in effect after restart
+
+### 7d. Hook recursion through gateway inference
+
+#### Symptoms
+
+- gateway process is alive and can still answer some probes, but user-facing replies become slow
+- current `top -H -p <gateway-pid>` shows a gateway thread consuming about one core
+- process checks do not show runaway model-runtime children or duplicate gateways
+- logs mention a local hook, `nativeHook.invoke`, `openclaw-infer`, liveness warnings, or queued work in a hook-owned lane
+
+#### Why this happens
+
+A local hook can accidentally call back into the same gateway it is running
+inside. A common shape is:
+
+1. message preprocessing hook runs inside the gateway
+2. hook launches a Python/Node helper synchronously
+3. helper runs `openclaw infer model run --gateway`
+4. that inference call waits on the same gateway event loop or queue that the hook is blocking
+
+This is a gateway re-entrancy problem, not a Telegram transport failure and not
+proof of a model-runtime process leak.
+
+#### Checks
+
+```bash
+top -H -p "$(systemctl --user show -p MainPID --value openclaw-gateway.service)"
+journalctl --user -u openclaw-gateway --since '10 minutes ago' --no-pager | \
+  grep -E 'nativeHook.invoke|openclaw-infer|liveness warning|hook'
+ps -eo pid,ppid,etime,%cpu,%mem,rss,cmd | \
+  grep -E 'openclaw-infer|python.*hook|node.*hook|openclaw.*gateway' | grep -v grep
+```
+
+Also inspect the hook source for environment flags or command calls that enable
+LLM parsing inside the synchronous hook path.
+
+#### Recovery
+
+- stop the recursive path first; do not broaden the restart loop
+- change the hook default to local deterministic parsing or metadata-only capture
+- gate LLM parsing behind an explicit opt-in environment variable
+- if LLM parsing is required, run it out of band through a queue, worker, cron, or separate runtime
+- restart the gateway after changing the hook source or deployed hook copy
+
+#### Validation
+
+- current `top -H -p <gateway-pid>` shows the gateway idle after the control window
+- no fresh `openclaw-infer` child remains from the hook path
+- a real Telegram or operator-facing control command receives a visible reply
+- model-runtime process checks still show only the intended singleton or expected worker set
+
+### 8. Bootstrap-bloat and startup-tax
+
+#### Symptoms
+
+- a fresh session is much slower than follow-up turns
+- the bot spends the first response reading multiple large memory or policy files before answering
+- `/fast` or lower thinking does not materially improve the first turn
+
+#### Why this happens
+
+Bootstrap files can drift from concise startup guidance into runbooks, incident logs, policy dumps, or domain playbooks. That turns every new session into a heavy preload.
+
+#### Checks
+
+Look for explicit reads of bootstrap and memory files near session start, and inspect the size and role of the startup files themselves:
+
+```bash
+wc -c AGENTS.md TOOLS.md SOUL.md MEMORY.md 2>/dev/null
+rg -n 'read|AGENTS.md|TOOLS.md|SOUL.md|MEMORY.md|LEARNINGS|workflow' ~/.openclaw/agents/*/sessions/*.jsonl 2>/dev/null
+```
+
+Questions to answer:
+
+- which files are read on every new session
+- which of those files are operational runbooks rather than bootstrap guidance
+- whether one slow first turn is startup-tax while later turns are normal
+
+#### Recovery
+
+- keep bootstrap files short and role-specific
+- move incident-response, host-ops, and domain-specific playbooks out of startup files
+- keep only the minimum session-start routing, safety, and index information in bootstrap context
+- if defaults and agent bindings are part of the drift, use a narrow config-normalization helper instead of broad manual rewrites
+
+Public helper example:
+
+```bash
+python3 ./scripts/normalize-openclaw-models.py ~/.openclaw/openclaw.json \
+  --primary <provider/model> \
+  --fallback <provider/model> \
+  --alias <alias> \
+  --agent-id <agent-id>
+```
+
+#### Validation
+
+- new-session startup reads fewer and smaller files
+- fresh-session first-response latency drops materially
+- workflow or safety rules still exist, but now live in the right documents
+
+### 9. Duplicate OpenClaw runtime on macOS
+
+#### Symptoms
+
+- `which -a openclaw` shows multiple installs
+- LaunchAgent points into one runtime while interactive shells use another
+- restarts appear to work, but behavior differs between manual runs and launchd-managed runs
+
+#### Why this happens
+
+macOS automation nodes often accumulate multiple OpenClaw installs across Homebrew, `npm -g`, or `~/.nvm`. Launchd and shell PATHs then disagree about which runtime is canonical.
+
+#### Checks
+
+```bash
+which -a openclaw
+launchctl print gui/$(id -u)/ai.openclaw.gateway 2>/dev/null | egrep 'program =|path =|args ='
+find ~/.nvm -path '*/lib/node_modules/openclaw/dist/index.js' 2>/dev/null
+```
+
+Also verify the Node runtime used by the active LaunchAgent and compare it with the shell's `openclaw`.
+
+#### Recovery
+
+- choose one canonical install path
+- reinstall or re-register the gateway from that canonical runtime
+- remove or disable duplicate installs and stale shims
+- verify that launchd and interactive shells now resolve to the same intended runtime
+
+Public helper:
+
+```bash
+./scripts/macos-single-openclaw-runtime.sh --dry-run
+./scripts/macos-single-openclaw-runtime.sh --apply
+```
+
+#### Validation
+
+- launchd no longer points at a duplicate or stale runtime
+- duplicate installs are gone or fully inactive
+- `openclaw gateway status` and a real control command behave consistently after restart
+
+### 10. Runtime bundle corruption or partial package replacement
+
+#### Symptoms
+
+- gateway fails with `MODULE_NOT_FOUND` or keeps surfacing a new missing chunk after each attempted fix
+- the service can be revived only by temporarily pointing it at a different local OpenClaw install
+- the intended install tree exists, but its `dist/` bundle looks suspiciously incomplete
+
+#### Why this happens
+
+This is usually not a one-file breakage.
+
+A manual copy, interrupted update, partial rollback, or local experiment can leave the canonical OpenClaw package only half-restored. In that state, restoring one missing entrypoint often just reveals the next missing compiled chunk.
+
+#### Checks
+
+Confirm the canonical runtime first, then inspect whether the installed bundle is complete enough to be believable:
+
+```bash
+systemctl --user cat openclaw-gateway 2>/dev/null | sed -n '1,160p'
+openclaw gateway status
+find /path/to/canonical/openclaw/dist -type f | wc -l
+ls -lah /path/to/canonical/openclaw/dist | sed -n '1,80p'
+```
+
+Also compare:
+
+- the `ExecStart` path in the active unit or launch agent
+- the live PID command line after restart
+- whether a nearby package backup or fresh reinstall contains far more runtime files than the broken tree
+- whether the next boot failure keeps changing from one missing module to another
+
+Red flags:
+
+- the active service points at one runtime tree, but emergency recovery keeps using another
+- `dist/` contains only a handful of files when a full package should contain many generated chunks
+- restoring one file only changes the missing-module error to a different file
+
+#### Recovery
+
+- do not normalize the emergency alternate runtime path as the final fix
+- do not start with one-file restore unless the breakage is proven to be isolated
+- restore or reinstall the entire canonical OpenClaw package from a trusted same-version build or local package backup
+- point the service back to the canonical runtime only after the full package is restored
+- restart and validate from the canonical path, not just the temporary workaround path
+
+#### Validation
+
+- the canonical service is `active`
+- `openclaw gateway status` is healthy on the intended runtime
+- the live PID command line matches the canonical install path
+- provider startup no longer fails on shifting `MODULE_NOT_FOUND` errors
+
+### 11. Plugin runtime contract drift after restart or update
+
+#### Symptoms
+
+- the gateway stays up, but one plugin, bound thread, or channel-specific feature goes silent
+- logs show plugin exceptions such as `Cannot read properties of undefined (...)`
+- the failure clusters around channel helpers like typing, send, topic rename, or other runtime-specific helpers
+- broad transport checks look healthy while one plugin path still fails
+
+#### Why this happens
+
+A plugin can depend on runtime helper surfaces that are optional, moved, or changed across OpenClaw versions and host environments.
+
+That creates a dangerous partial-failure pattern: the gateway is alive enough to receive the event, but the plugin crashes when it touches a helper that is no longer present in the live runtime contract.
+
+#### Checks
+
+```bash
+openclaw gateway status
+rg -n 'Cannot read properties of undefined|failed to load plugin|plugin.*error|message:transcribed|message:preprocessed' ~/.openclaw/logs /tmp/openclaw 2>/dev/null
+rg -n 'runtime\.channel\.|typing\.|sendMessage|renameTopic|resolve.*Token' /path/to/plugin/source /path/to/plugin/runtime 2>/dev/null
+```
+
+Ask these questions:
+
+- is the gateway healthy while only one plugin path fails
+- does the plugin assume a channel-specific runtime object always exists
+- did the issue start right after a restart, update, redeploy, or host move
+- was only the live deployed copy patched while the source tree stayed stale, or vice versa
+
+#### Recovery
+
+- treat this as a plugin compatibility incident, not automatically as a full transport outage
+- replace hard assumptions about channel-specific runtime helpers with compatibility fallbacks where possible
+- prefer stable plugin SDK helpers or generic APIs over host-specific runtime import paths
+- wrap non-critical hook boundaries so one bad event degrades locally instead of crashing the whole plugin path
+- if the environment has both a deployed runtime copy and a source repo, patch both or the regression will return on the next deploy
+
+#### Validation
+
+- gateway restarts cleanly
+- fresh logs no longer show the `undefined` helper crash pattern
+- the previously silent bound thread or plugin feature replies again on a real control path
+- the maintained source tree passes its relevant tests or build checks
+
+### 12. Duplicate runtimes, duplicate supervisors, or wrong-target diagnosis
+
+#### Symptoms
+
+- one health check says the gateway is healthy, but Telegram or another user-facing path still shows polling conflicts, stale behavior, or inconsistent results
+- manual restarts appear to help briefly, but the same transport conflict or duplicate-listener symptom comes back
+- shell commands and service-manager state appear to point at different OpenClaw installs, ports, or launch targets
+
+#### Why this happens
+
+Some hosts accidentally end up with two OpenClaw runtimes or two supervisors managing the same environment.
+
+Common patterns:
+
+- user-level service plus system-level service
+- launch agent plus manual shell process
+- old install plus new install on different paths
+- two runtimes sharing one state directory or one Telegram token
+
+This creates false diagnosis loops. One runtime can look healthy while the other is the one actually colliding, polling, or serving stale behavior.
+
+#### Checks
+
+Confirm the canonical target first, then verify that there is only one active owner for the affected runtime and state:
+
+```bash
+ps -ef | grep -Ei 'openclaw|gateway' | grep -v grep
+ss -tulpn | grep -Ei 'openclaw|127\.0\.0\.1:'
+systemctl --user status openclaw-gateway --no-pager -l 2>/dev/null
+systemctl status openclaw-gateway --no-pager -l 2>/dev/null
+```
+
+Also compare:
+
+- `which -a openclaw`
+- the active service `ExecStart`
+- the live PID command line
+- the active listener ports
+- the runtime directory or shared state directory used by each process
+
+Red flags:
+
+- two OpenClaw process trees at the same time
+- one manager reports healthy while another still owns a conflicting process
+- the shell CLI resolves to one install while the service uses another
+- duplicate runtimes share one state directory or the same transport credentials
+
+#### Recovery
+
+- choose one canonical runtime path and one canonical supervisor
+- disable or remove the duplicate runtime or duplicate supervisor before changing auth, transport, or plugin code
+- re-check listeners and process trees after the stop action; do not assume disable alone removed the old runtime
+- only after duplication is gone should you continue with transport or provider debugging
+
+#### Validation
+
+- exactly one intended OpenClaw runtime remains active for the affected environment
+- the canonical service manager view, PID path, and listener ports agree with each other
+- fresh logs no longer show duplicate-polling or duplicate-runtime conflict symptoms
+- a real control probe behaves consistently after restart
+
+### 12a. Watchdog stale-log restart loop
+
+#### Symptoms
+
+- the gateway comes back healthy, but a custom watchdog restarts it again within the next minute or two
+- shallow health checks sometimes look green, yet Telegram or another user-facing path stays unstable
+- watchdog logs show repeated restart reasons tied to the same severe transport or lane-stall signal
+
+#### Why this happens
+
+Some watchdogs read a sliding log window such as `journalctl --since '-4 min'` and treat any severe line inside that window as fresh evidence.
+
+If the gateway already restarted, that window can still contain severe lines emitted by the previous PID. The watchdog then reuses stale evidence, kills the new healthy process, and creates the flapping loop itself.
+
+This is not just an aggressive restart policy problem. It is an evidence-isolation problem between old and current runtime epochs.
+
+#### Checks
+
+Confirm whether the same old severe event is being replayed against a newer gateway PID:
+
+```bash
+systemctl --user show openclaw-gateway -p MainPID -p ActiveEnterTimestamp --no-pager 2>/dev/null
+journalctl --user -u openclaw-gateway --since '-10 min' --no-pager 2>/dev/null | tail -n 200
+journalctl --user -u openclaw-gateway-watchdog --since '-10 min' --no-pager 2>/dev/null | tail -n 200
+```
+
+Look for this pattern:
+
+- watchdog restart reasons repeat with the same signal class
+- the severe log line timestamp is older than the current gateway start time
+- the watchdog keeps using a sliding recent window instead of a runtime epoch, journal cursor, or durable watermark
+
+#### Recovery
+
+- do not keep tuning transport first if the watchdog itself is causing the flapping
+- bind severe restart decisions to the current runtime epoch, journal cursor, or another durable watermark
+- suppress duplicate handling of the same already-consumed severe event
+- add a short cooldown for severe-signal restarts so one noisy burst cannot keep killing fresh PIDs
+- if the watchdog currently uses broad kill patterns, replace them with a restart of the canonical service target
+
+#### Validation
+
+- the watchdog can run against a healthy gateway without forcing another false restart
+- historical severe lines in the recent journal no longer trigger a restart for the current PID
+- watchdog logs show explicit healthy or suppressed-state output instead of repeated restart reasons
+- a real user-facing probe stays stable across at least one watchdog interval
+
+### 13. Recovery validation: prove the fix on the real path
+
+#### Symptoms
+
+- the unit is `active`, but users still report silence, delays, or partial failures
+- logs are quieter after restart, but there is no end-to-end proof that the broken path works again
+- the operator is tempted to declare success based only on service-manager green state
+
+#### Why this matters
+
+Restart is an action, not evidence.
+
+OpenClaw incidents often recover partially: the main process comes back, but the original broken path may still be jammed, misrouted, degraded, or attached to the wrong runtime.
+
+#### Minimum validation ladder
+
+Use the strongest available post-fix proof in this order:
+
+1. real user-facing probe on the originally broken path
+2. canonical gateway health or RPC check
+3. matching process-manager and listener state
+4. fresh logs that stay clean during a short control window
+
+#### Checks
+
+```bash
+openclaw gateway status
+journalctl --user -u openclaw-gateway --since '-5 min' --no-pager 2>/dev/null | tail -n 120
+```
+
+Then verify all of these where applicable:
+
+- the originally broken chat, plugin path, or transport action now succeeds
+- the canonical runtime path is the one actually serving
+- no immediate recurrence appears in the first control window after restart
+- residual degradation is called out explicitly instead of hidden behind a green status
+
+#### Recovery wording rules
+
+Allowed:
+
+- `The service is back on the canonical runtime, but end-to-end recovery is still being verified.`
+- `Availability recovered; one degraded path is still being watched.`
+- `Restart succeeded, but recovery is not confirmed until the real control probe passes.`
+
+Avoid:
+
+- `Recovered.` immediately after restart
+- `Healthy.` based only on `systemctl active`
+- `Fixed.` when only a shallow probe is green
+
+### 14. Post-update elevated approval drift: global vs per-agent gating
+
+#### Symptoms
+
+- after an update, one chat or one agent suddenly asks for approval on nearly every elevated action
+- another chat on the same host still runs elevated commands without the same friction
+- the operator suspects `agents.defaults.elevatedDefault`, but changing or inspecting it does not explain the difference
+
+#### Why this happens
+
+In current OpenClaw setups, elevated execution is usually controlled by global and per-agent `tools.elevated` policy, not by assuming that `agents.defaults.elevatedDefault` is the deciding switch.
+
+That means behavior can differ by agent even on the same host:
+
+- global `tools.elevated` defines the baseline capability
+- per-agent `tools.elevated` can further restrict that capability
+- sender allowlists under `tools.elevated.allowFrom.<channel>` can differ between the global policy and the agent-specific override
+
+So a post-update approval surprise is often an agent-routing or agent-policy issue, not a missing default toggle.
+
+#### Checks
+
+Look at both the global and per-agent policy, and verify which agent actually handled the request:
+
+```bash
+rg -n 'elevatedDefault|tools\.elevated|allowFrom' ~/.openclaw/openclaw.json 2>/dev/null
+openclaw gateway status
+```
+
+Confirm:
+
+- whether `agents.defaults.elevatedDefault` is actually set
+- whether global `tools.elevated.enabled` is on
+- whether global `tools.elevated.allowFrom.<channel>` includes the intended sender class
+- whether the selected agent has its own `tools.elevated` block that narrows access
+- whether the request was routed to a different agent after the update
+
+#### Recovery
+
+- do not assume `agents.defaults.elevatedDefault` is the root cause
+- first identify which agent handled the request
+- compare the global elevated policy with that agent's own `tools.elevated` override
+- if behavior drift appeared after an update or routing change, align the intended agent policy instead of widening elevated access everywhere
+- keep the fix narrow: adjust the relevant agent or allowlist rather than opening elevated globally without need
+
+#### Operator guidance
+
+When this pattern is detected, `server-doctor` should proactively offer the fix instead of stopping at diagnosis.
+
+Recommended wording:
+
+- `I found elevated policy drift between the global config and the selected agent. I can align the intended agent so approvals stop appearing on every elevated action while keeping stricter agents strict.`
+- `This does not look like an agents.defaults.elevatedDefault issue. It looks like per-agent elevated policy drift. I can patch the intended agent's tools.elevated settings narrowly instead of opening elevated everywhere.`
+
+Default action bias:
+
+- if the operator's intent is clear and the target agent is unambiguous, propose the narrow policy alignment as the next step
+- prefer fixing the intended agent's `tools.elevated` configuration over broad global widening
+- call out explicitly when the stricter behavior on other agents should remain unchanged
+
+#### Validation
+
+- the same sender now sees consistent elevated behavior on the intended agent
+- a different agent with stricter policy stays strict if that is intentional
+- approval prompts now match the configured policy instead of surprising the operator
+
+### 15. Restart-drain or tool-loop silence
+
+#### Symptoms
+
+- the runtime accepts a restart, but the user-facing lane stays quiet longer than expected
+- logs show in-flight work, tool-loop overflow, compaction churn, or queue ownership messages around the restart window
+- shallow gateway health returns before the originally affected chat has produced a complete reply
+
+#### Why this happens
+
+A restart can be deferred or complicated by active turns, oversized context, stuck tool loops, or queue-drain behavior. The process may be alive while the original lane is still not recovered.
+
+#### Checks
+
+```bash
+openclaw gateway status
+openclaw status --deep
+journalctl --user -u openclaw-gateway --since '-15 min' --no-pager 2>/dev/null | tail -n 240
+rg -n 'tool loop|in-flight|drain|compaction|context|queue owner|stale lock|restart' ~/.openclaw/agents ~/.openclaw/logs /tmp/openclaw 2>/dev/null
+```
+
+#### Recovery
+
+- distinguish deferred restart/drain from transport outage
+- avoid stacking repeated restarts while a previous graceful restart or drain is still resolving
+- if a single chat/session is wedged, prefer a narrow session/queue repair over wiping global state
+- if context bloat is the trigger, reduce the affected session path or start a fresh bounded lane rather than broad config changes
+
+#### Validation
+
+- the originally affected chat completes a fresh small prompt
+- logs no longer show repeated drain/tool-loop/context errors for that lane
+- the process has remained stable across a short control window
+
+### 16. Telegram media/caption or generated-artifact partial failure
+
+#### Symptoms
+
+- Telegram text works, but image+caption, generated media, or document attachment paths fail
+- inbound media appears on disk, yet the downstream model/plugin receives only text
+- generated artifacts are created locally but not delivered to the user
+- inline `MEDIA:/absolute/path/...` text appears instead of an attachment
+
+#### Why this happens
+
+Media handling often spans multiple layers: Telegram download, message metadata normalization, plugin turn protocol, local file materialization, final-payload delivery, and outbound channel delivery. A green text path does not prove the media path.
+
+#### Checks
+
+```bash
+find ~/.openclaw/media -maxdepth 3 -type f -mmin -30 2>/dev/null | tail -n 50
+rg -n 'MediaPaths|mediaPaths|localImage|type.*image|data:image|MEDIA:|shouldDropFinalPayloads|attachment' ~/.openclaw/logs /tmp/openclaw /path/to/plugin 2>/dev/null
+```
+
+Ask:
+
+- did Telegram download the file
+- did the plugin normalize both lowercase and runtime-specific metadata keys
+- did the client materialize local files into the protocol shape expected by the backend
+- did the final assistant output use a supported attachment route instead of host-local absolute `MEDIA:` text
+
+#### Recovery
+
+- fix the narrow layer that dropped the media; do not blame Telegram transport until download and metadata are checked
+- use tool-backed file/document delivery when normal reply media syntax cannot safely reference the file
+- if a plugin has both source and deployed copies, patch and test both or the bug will return on next deploy
+
+#### Validation
+
+- a fresh image+caption probe reaches the model/plugin as an image, not only text
+- generated file delivery arrives as an attachment, not literal `MEDIA:` text
+- tests or targeted smoke checks cover the exact media shape that failed
+
+### 17. Dedicated chat/group binding drift
+
+#### Symptoms
+
+- a Telegram group still gets replies, but from the wrong/default agent
+- a dedicated workflow skill stops being applied after config migration, update, or doctor repair
+- group prompt contains stale copied workflow rules that disagree with the current skill
+
+#### Why this happens
+
+The gateway can remain healthy while routing changes. Bindings, `channels.telegram.groups`, agent `skills`, and group `systemPrompt` are independent config surfaces; a repair can update one and leave another stale.
+
+#### Checks
+
+```bash
+rg -n 'bindings|channels.*telegram|groups|agentId|skills|systemPrompt' ~/.openclaw/openclaw.json
+```
+
+Confirm:
+
+- the intended agent exists
+- the intended skill is attached to that agent
+- the exact Telegram peer routes to that agent
+- the group config enables the skill as needed
+- the prompt is a short routing guard and points to the canonical skill source instead of duplicating workflow rules
+
+Public helper:
+
+```bash
+python3 ./scripts/ensure-telegram-group-agent-binding.py \
+  --config ~/.openclaw/openclaw.json \
+  --chat-id '<telegram-group-id>' \
+  --agent-id '<agent-id>' \
+  --skill-id '<skill-id>' \
+  --skill-source '<canonical-skill-path>' \
+  --dry-run
+```
+
+#### Recovery
+
+- repair the binding narrowly instead of widening global routing or access
+- keep procedural rules in the skill, not in the chat prompt
+- restart or reload through the canonical service manager if the runtime does not pick up config changes
+
+#### Validation
+
+- a fresh real message in the group lands in the dedicated agent session
+- the correct skill behavior appears without adding long duplicate prompt rules
+
+### 18. Source/deployed-copy drift after hotfixes
+
+#### Symptoms
+
+- a bug is fixed in a checkout but returns after restart, deploy, or update
+- live behavior differs from the maintained source tree
+- tests pass in one directory but the runtime loads another directory
+
+#### Why this happens
+
+Some plugin or extension installs have both a maintained repo and a deployed runtime copy. Hotfixing only one copy creates a temporary repair, not a durable fix.
+
+#### Checks
+
+```bash
+ps -ef | grep -Ei 'openclaw|plugin|extension' | grep -v grep
+rg -n '<changed-symbol-or-error>' /path/to/source /path/to/deployed-copy 2>/dev/null
+find ~/.openclaw/extensions -maxdepth 3 -type f -mmin -120 2>/dev/null
+```
+
+#### Recovery
+
+- identify the path actually loaded by the gateway
+- patch the loaded copy for immediate recovery if needed
+- also patch the maintained source or packaging path before closing the task
+- rerun targeted tests from the path whose code will be deployed next
+
+#### Validation
+
+- runtime behavior is fixed after restart
+- the maintained source contains the same general fix
+- a future update/deploy path will not silently drop the change
+
+## What to avoid
+
+- do not rotate secrets during first response unless compromise is suspected
+- do not wipe state directories to “start fresh”
+- do not delete sessions, volumes, or compose stacks without evidence
+- do not publish raw logs if they may contain tokens or private routing data
+
+## Public-safe incident summary format
+
+- symptom
+- scope
+- confirmed healthy components
+- confirmed failing components
+- probable root cause
+- recovery action taken
+- residual risk
